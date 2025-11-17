@@ -1,301 +1,293 @@
-  # main.py
+# main.py
+# Требования: pyTelegramBotAPI (telebot), Flask
+# Переменные окружения (на Render):
+# BOT_TOKEN - токен телеграм-бота
+# OWNER_ID - твой Telegram ID (число). Будет владелец/админ.
+# WEBHOOK - полный URL вебхука, куда Telegram будет слать обновления (например: https://your-domain.com/).
+#            Если Telegram требует путь с токеном, укажи полный путь. Важно: этот URL должен быть доступен извне.
+
 import os
-import json
 import time
+import threading
 import secrets
-from datetime import datetime, timezone, timedelta
 from flask import Flask, request
 import telebot
 
-# --- Config from ENV ---
-TOKEN = os.getenv("BOT_TOKEN")
-WEBHOOK_URL = os.getenv("WEBHOOK_URL", "").rstrip("/")  # без завершающего /
-OWNER_ID = str(os.getenv("OWNER_ID", "")).strip()
+# --- Настройки ключей ---
+KEY_TTL_SECONDS = 6 * 60 * 60   # 6 часов (вариант B)
+KEY_MAX_USES = 1                # каждое ключевое использование можно активировать 1 раз
+KEY_MAX_ATTEMPTS = 1            # ограничение попыток (если кто-то пытался использовать ключ — он засчитывается)
 
-if not TOKEN:
-    raise RuntimeError("BOT_TOKEN is not set in environment variables.")
-if not WEBHOOK_URL:
-    raise RuntimeError("WEBHOOK_URL is not set in environment variables.")
+# --- Инициализация ---
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+OWNER_ID = os.getenv("OWNER_ID")  # строка
+WEBHOOK_URL = os.getenv("WEBHOOK")  # полный URL, который Telegram будет POST'ить
+
+if not BOT_TOKEN:
+    raise RuntimeError("No BOT_TOKEN set in env")
 if not OWNER_ID:
-    raise RuntimeError("OWNER_ID is not set in environment variables.")
+    raise RuntimeError("No OWNER_ID set in env")
+if not WEBHOOK_URL:
+    raise RuntimeError("No WEBHOOK set in env")
 
-DATA_FILE = "data.json"
+try:
+    OWNER_ID_INT = int(OWNER_ID)
+except:
+    raise RuntimeError("OWNER_ID must be an integer string")
 
-# --- Telebot + Flask ---
-bot = telebot.TeleBot(TOKEN)
-app = Flask(__name__)
+bot = telebot.TeleBot(BOT_TOKEN, threaded=True)
+server = Flask(__name__)
 
-# --- Helpers: persistent storage for admins / keys / allowed users ---
-def load_data():
-    if not os.path.exists(DATA_FILE):
-        # initial structure
-        data = {
-            "admins": [OWNER_ID],       # list of user ids as strings
-            "allowed": {},              # user_id -> expiry_ts (int epoch)
-            "keys": {}                  # key -> {expires:ts, max_uses:int, uses:int, used_by:[], issued_by:id}
+# --- In-memory storage (D) ---
+allowed_users = set([OWNER_ID_INT])  # владельца добавляем сразу
+# keys: key_str -> { 'created': ts, 'uses_left': int, 'attempts': int }
+keys = {}
+# optionally keep a small log of issued keys -> owner/admin can list if needed
+issued_keys = {}
+
+storage_lock = threading.Lock()
+
+# --- Helper functions ---
+def is_admin(user_id: int) -> bool:
+    return user_id == OWNER_ID_INT
+
+def cleanup_expired_keys():
+    """Запускается в фоне — удаляет просроченные ключи."""
+    while True:
+        now = time.time()
+        with storage_lock:
+            expired = [k for k,v in keys.items() if now - v['created'] > KEY_TTL_SECONDS or v['uses_left'] <= 0]
+            for k in expired:
+                keys.pop(k, None)
+        time.sleep(60)
+
+def generate_key():
+    k = secrets.token_urlsafe(8)  # короткий удобный ключ
+    with storage_lock:
+        keys[k] = {
+            'created': time.time(),
+            'uses_left': KEY_MAX_USES,
+            'attempts': 0
         }
-        save_data(data)
-        return data
-    with open(DATA_FILE, "r", encoding="utf-8") as f:
-        return json.load(f)
+        issued_keys[k] = time.time()
+    return k
 
-def save_data(data):
-    with open(DATA_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+# --- Commands ---
 
-def is_admin(user_id):
-    data = load_data()
-    return str(user_id) in data.get("admins", [])
-
-def is_allowed(user_id):
-    data = load_data()
-    user_id = str(user_id)
-    expiry = data.get("allowed", {}).get(user_id)
-    if not expiry:
-        return False
-    return int(expiry) > int(time.time())
-
-def grant_temporary_access(user_id, minutes):
-    data = load_data()
-    expiry_ts = int(time.time()) + int(minutes) * 60
-    data.setdefault("allowed", {})[str(user_id)] = expiry_ts
-    save_data(data)
-    return expiry_ts
-
-def revoke_access(user_id):
-    data = load_data()
-    if str(user_id) in data.get("allowed", {}):
-        del data["allowed"][str(user_id)]
-        save_data(data)
-        return True
-    return False
-
-# --- Key generation / usage ---
-def create_key(ttl_minutes=60, max_uses=1, issued_by=None):
-    data = load_data()
-    key = secrets.token_urlsafe(12)
-    data.setdefault("keys", {})[key] = {
-        "expires": int(time.time()) + int(ttl_minutes) * 60,
-        "max_uses": int(max_uses),
-        "uses": 0,
-        "used_by": [],
-        "issued_by": str(issued_by) if issued_by else None
-    }
-    save_data(data)
-    return key
-
-def use_key(key, user_id):
-    data = load_data()
-    entry = data.get("keys", {}).get(key)
-    now = int(time.time())
-    if not entry:
-        return (False, "Key not found.")
-    if entry["expires"] < now:
-        return (False, "Key expired.")
-    if str(user_id) in entry.get("used_by", []):
-        return (False, "You already used this key.")
-    if entry["uses"] >= entry["max_uses"]:
-        return (False, "Key has no remaining uses.")
-    # Accept usage
-    entry["uses"] += 1
-    entry.setdefault("used_by", []).append(str(user_id))
-    save_data(data)
-    return (True, "Key accepted.")
-
-# --- Commands handlers ---
 @bot.message_handler(commands=['start'])
 def cmd_start(message):
-    bot.reply_to(message, "Привет! Это бот с системой доступа. Используй /help для списка команд.")
-
-@bot.message_handler(commands=['help'])
-def cmd_help(message):
-    help_text = (
-        "/help - этот текст\n"
-        "/status - проверить ваш доступ\n"
-        "/usekey <key> - активировать ключ доступа\n"
-        "/key - (admins) сгенерировать временный ключ: /key <minutes> <max_uses>\n"
-        "/grant <user_id> <minutes> - (admins) выдать доступ пользователю на минуты\n"
-        "/revoke <user_id> - (admins) забрать доступ\n"
-        "/addadmin <user_id> - (owner only) добавить администратора\n"
-        "/removeadmin <user_id> - (owner only) убрать администратора\n"
-        "/admin - открыть краткую админ-панель (текстовая)\n"
-    )
-    bot.reply_to(message, help_text)
-
-@bot.message_handler(commands=['status'])
-def cmd_status(message):
-    uid = str(message.from_user.id)
-    if is_allowed(uid):
-        expiry = load_data()["allowed"][uid]
-        dt = datetime.fromtimestamp(int(expiry), tz=timezone.utc).astimezone()
-        bot.reply_to(message, f"У вас есть доступ до: {dt.isoformat()}")
+    user_id = message.from_user.id
+    bot.reply_to(message, "Привет! Бот запущен. Используй /menu чтобы увидеть доступные команды.")
+    
+@bot.message_handler(commands=['menu'])
+def cmd_menu(message):
+    uid = message.from_user.id
+    if is_admin(uid):
+        text = ("🔐 Админ-панель\n"
+                "Команды:\n"
+                "/add <id> — выдать доступ\n"
+                "/remove <id> — убрать доступ\n"
+                "/users — список пользователей\n"
+                "/genkey — сгенерировать временный ключ (6ч, 1 использование)\n"
+                "/revoke_key <key> — отозвать ключ\n"
+                "/broadcast <текст> — рассылка всем доступным\n"
+                "/key <ключ> — активировать ключ (пользовательская команда)\n")
     else:
-        bot.reply_to(message, "У вас сейчас нет доступа. Получите ключ у администратора или используйте /usekey <key>")
+        text = ("Меню:\n"
+                "/start — проверка\n"
+                "/key <ключ> — активировать временный доступ\n"
+                "Если у тебя есть доступ — используй основные команды бота.")
+    bot.send_message(uid, text)
 
-@bot.message_handler(commands=['usekey'])
-def cmd_usekey(message):
-    parts = message.text.strip().split()
+# Admin: add
+@bot.message_handler(commands=['add'])
+def cmd_add(message):
+    uid = message.from_user.id
+    if not is_admin(uid):
+        bot.reply_to(message, "Только владелец может выдавать доступ.")
+        return
+    parts = message.text.split()
     if len(parts) < 2:
-        bot.reply_to(message, "Использование: /usekey <key>")
+        bot.reply_to(message, "Использование: /add <user_id>")
         return
-    key = parts[1].strip()
-    ok, info = use_key(key, message.from_user.id)
-    if not ok:
-        bot.reply_to(message, f"Ключ не подошёл: {info}")
+    try:
+        target = int(parts[1])
+    except:
+        bot.reply_to(message, "Неверный ID.")
         return
-    # при успешном использовании даём временный доступ, например 60 минут по умолчанию
-    expiry_ts = int(time.time()) + 60*60
-    data = load_data()
-    data.setdefault("allowed", {})[str(message.from_user.id)] = expiry_ts
-    save_data(data)
-    dt = datetime.fromtimestamp(expiry_ts, tz=timezone.utc).astimezone()
-    bot.reply_to(message, f"Ключ принят. У вас доступ до {dt.isoformat()}")
+    with storage_lock:
+        allowed_users.add(target)
+    bot.reply_to(message, f"✅ Пользователь {target} получил доступ.")
 
-@bot.message_handler(commands=['admin'])
-def cmd_admin(message):
-    uid = str(message.from_user.id)
-    if not is_admin(uid) and uid != OWNER_ID:
-        bot.reply_to(message, "Только администраторы могут использовать эти команды.")
+# Admin: remove
+@bot.message_handler(commands=['remove'])
+def cmd_remove(message):
+    uid = message.from_user.id
+    if not is_admin(uid):
+        bot.reply_to(message, "Только владелец может убирать доступ.")
         return
-    text = (
-        "Админ-панель (текстовая):\n"
-        "/key <minutes> <max_uses> - создать ключ\n"
-        "/grant <user_id> <minutes> - выдать доступ\n"
-        "/revoke <user_id> - отозвать доступ\n"
-        "/addadmin <user_id> - добавить администратора (owner only)\n"
-        "/removeadmin <user_id> - убрать администратора (owner only)\n"
-    )
+    parts = message.text.split()
+    if len(parts) < 2:
+        bot.reply_to(message, "Использование: /remove <user_id>")
+        return
+    try:
+        target = int(parts[1])
+    except:
+        bot.reply_to(message, "Неверный ID.")
+        return
+    with storage_lock:
+        if target in allowed_users:
+            allowed_users.remove(target)
+            bot.reply_to(message, f"✅ Доступ у {target} удалён.")
+        else:
+            bot.reply_to(message, "Пользователь не в списке доступа.")
+
+# Admin: list users
+@bot.message_handler(commands=['users'])
+def cmd_users(message):
+    uid = message.from_user.id
+    if not is_admin(uid):
+        bot.reply_to(message, "Только владелец может смотреть список пользователей.")
+        return
+    with storage_lock:
+        if not allowed_users:
+            bot.reply_to(message, "Список пуст.")
+            return
+        text = "Пользователи с доступом:\n" + "\n".join(str(x) for x in sorted(allowed_users))
     bot.reply_to(message, text)
 
+# Admin: broadcast
+@bot.message_handler(commands=['broadcast'])
+def cmd_broadcast(message):
+    uid = message.from_user.id
+    if not is_admin(uid):
+        bot.reply_to(message, "Только владелец может рассылать.")
+        return
+    parts = message.text.split(maxsplit=1)
+    if len(parts) < 2:
+        bot.reply_to(message, "Использование: /broadcast <текст>")
+        return
+    text = parts[1]
+    with storage_lock:
+        targets = list(allowed_users)
+    success = 0
+    for t in targets:
+        try:
+            bot.send_message(t, text)
+            success += 1
+        except Exception:
+            pass
+    bot.reply_to(message, f"📬 Рассылка завершена. Отправлено: {success}/{len(targets)}")
+
+# Admin: genkey
+@bot.message_handler(commands=['genkey'])
+def cmd_genkey(message):
+    uid = message.from_user.id
+    if not is_admin(uid):
+        bot.reply_to(message, "Только владелец может генерировать ключи.")
+        return
+    k = generate_key()
+    bot.reply_to(message, f"🔑 Ключ: `{k}`\nСрок: 6 часов, 1 использование.\nКоманда для активации: /key {k}", parse_mode='Markdown')
+
+# Admin: revoke key
+@bot.message_handler(commands=['revoke_key'])
+def cmd_revoke_key(message):
+    uid = message.from_user.id
+    if not is_admin(uid):
+        bot.reply_to(message, "Только владелец может отзывать ключи.")
+        return
+    parts = message.text.split()
+    if len(parts) < 2:
+        bot.reply_to(message, "Использование: /revoke_key <ключ>")
+        return
+    k = parts[1].strip()
+    with storage_lock:
+        if k in keys:
+            keys.pop(k, None)
+            bot.reply_to(message, f"Ключ {k} отозван.")
+        else:
+            bot.reply_to(message, "Ключ не найден или уже истёк.")
+
+# User: activate key
 @bot.message_handler(commands=['key'])
 def cmd_key(message):
-    uid = str(message.from_user.id)
-    if not is_admin(uid) and uid != OWNER_ID:
-        bot.reply_to(message, "Только администраторы могут выдавать ключи.")
-        return
-    parts = message.text.strip().split()
+    uid = message.from_user.id
+    parts = message.text.split()
     if len(parts) < 2:
-        bot.reply_to(message, "Использование: /key <minutes> [max_uses]\nПример: /key 60 1")
+        bot.reply_to(message, "Использование: /key <ключ>")
         return
-    minutes = int(parts[1])
-    max_uses = int(parts[2]) if len(parts) >= 3 else 1
-    key = create_key(ttl_minutes=minutes, max_uses=max_uses, issued_by=uid)
-    bot.reply_to(message, f"Ключ: `{key}`\nДействует {minutes} мин, max uses: {max_uses}", parse_mode='Markdown')
+    k = parts[1].strip()
+    with storage_lock:
+        entry = keys.get(k)
+        if not entry:
+            bot.reply_to(message, "❌ Неверный или просроченный ключ.")
+            return
+        # attempts check
+        if entry['attempts'] >= KEY_MAX_ATTEMPTS:
+            bot.reply_to(message, "❌ Превышено число попыток для этого ключа.")
+            # можно удалить ключ
+            keys.pop(k, None)
+            return
+        # valid -> consume
+        entry['attempts'] += 1
+        if time.time() - entry['created'] > KEY_TTL_SECONDS:
+            keys.pop(k, None)
+            bot.reply_to(message, "❌ Ключ истёк.")
+            return
+        if entry['uses_left'] <= 0:
+            keys.pop(k, None)
+            bot.reply_to(message, "❌ Ключ уже использован.")
+            return
+        # give access
+        entry['uses_left'] -= 1
+        allowed_users.add(uid)
+        bot.reply_to(message, "✅ Ключ принят. У тебя временный доступ.")
+        # если uses_left ==0 — удалить ключ
+        if entry['uses_left'] <= 0:
+            keys.pop(k, None)
 
-@bot.message_handler(commands=['grant'])
-def cmd_grant(message):
-    uid = str(message.from_user.id)
-    if not is_admin(uid) and uid != OWNER_ID:
-        bot.reply_to(message, "Только администраторы могут выдавать доступ.")
+# Example of a protected command (keeps old functionality)
+@bot.message_handler(commands=['protected'])
+def cmd_protected(message):
+    uid = message.from_user.id
+    if uid not in allowed_users:
+        bot.reply_to(message, "У тебя нет доступа к этой команде. Попроси админа /key <ключ> или получить доступ.")
         return
-    parts = message.text.strip().split()
-    if len(parts) < 3:
-        bot.reply_to(message, "Использование: /grant <user_id> <minutes>")
-        return
-    target = parts[1]
-    minutes = int(parts[2])
-    expiry = grant_temporary_access(target, minutes)
-    dt = datetime.fromtimestamp(expiry, tz=timezone.utc).astimezone()
-    bot.reply_to(message, f"Выдан доступ пользователю {target} до {dt.isoformat()}")
+    bot.reply_to(message, "Выполняю защищённую функцию... (старый функционал)")
 
-@bot.message_handler(commands=['revoke'])
-def cmd_revoke(message):
-    uid = str(message.from_user.id)
-    if not is_admin(uid) and uid != OWNER_ID:
-        bot.reply_to(message, "Только администраторы могут отзывать доступ.")
-        return
-    parts = message.text.strip().split()
-    if len(parts) < 2:
-        bot.reply_to(message, "Использование: /revoke <user_id>")
-        return
-    target = parts[1]
-    ok = revoke_access(target)
-    if ok:
-        bot.reply_to(message, f"Доступ у {target} отозван.")
-    else:
-        bot.reply_to(message, f"У {target} не было активного доступа.")
+# --- Webhook / Flask endpoints ---
+@server.route('/', methods=['GET'])
+def index():
+    return "Bot is running", 200
 
-@bot.message_handler(commands=['addadmin'])
-def cmd_addadmin(message):
-    if str(message.from_user.id) != OWNER_ID:
-        bot.reply_to(message, "Только владелец может добавлять админов.")
-        return
-    parts = message.text.strip().split()
-    if len(parts) < 2:
-        bot.reply_to(message, "Использование: /addadmin <user_id>")
-        return
-    target = parts[1]
-    data = load_data()
-    if target in data.get("admins", []):
-        bot.reply_to(message, f"{target} уже является админом.")
-        return
-    data.setdefault("admins", []).append(str(target))
-    save_data(data)
-    bot.reply_to(message, f"{target} добавлен в админы.")
-
-@bot.message_handler(commands=['removeadmin'])
-def cmd_removeadmin(message):
-    if str(message.from_user.id) != OWNER_ID:
-        bot.reply_to(message, "Только владелец может удалять админов.")
-        return
-    parts = message.text.strip().split()
-    if len(parts) < 2:
-        bot.reply_to(message, "Использование: /removeadmin <user_id>")
-        return
-    target = parts[1]
-    data = load_data()
-    if target not in data.get("admins", []):
-        bot.reply_to(message, f"{target} не найден в списке админов.")
-        return
-    data["admins"].remove(target)
-    save_data(data)
-    bot.reply_to(message, f"{target} исключен из админов.")
-
-# --- Example: protect main functionality ---
-# Здесь можно добавить обработчик основного функционала бота, и разрешать только allowed users.
-@bot.message_handler(func=lambda m: True)
-def fallback(m):
-    # любой общий функционал — доступен только тем у кого есть разрешение
-    if is_allowed(m.from_user.id) or is_admin(str(m.from_user.id)) or str(m.from_user.id) == OWNER_ID:
-        # Тут оставить существующий функционал, например приветствие
-        if m.text and m.text.lower().startswith("hello") or m.text and "привет" in m.text.lower():
-            bot.reply_to(m, f"Привет, {m.from_user.first_name}! У тебя есть доступ.")
-        else:
-            bot.reply_to(m, "Команда не распознана. Используйте /help.")
-    else:
-        bot.reply_to(m, "У вас нет доступа к функциям бота. Получите ключ у администратора или используйте /usekey <key>")
-
-# --- Webhook routes ---
-@app.route('/' + TOKEN, methods=['POST'])
-def webhook_handler():
+@server.route('/', methods=['POST'])
+def webhook_view():
+    # Telegram posts updates here
     try:
         json_string = request.get_data().decode('utf-8')
         update = telebot.types.Update.de_json(json_string)
         bot.process_new_updates([update])
     except Exception as e:
-        # логируем, но не ломаем
-        print("Webhook error:", e)
-    return "OK", 200
+        # log exception if needed
+        print("Webhook processing error:", e)
+    return '', 200
 
-@app.route('/')
-def index():
-    return "Bot is running!", 200
+# --- Start background cleanup thread ---
+cleanup_thread = threading.Thread(target=cleanup_expired_keys, daemon=True)
+cleanup_thread.start()
 
-# --- Setup webhook on start ---
-def setup_webhook():
-    try:
-        bot.remove_webhook()
-    except Exception:
-        pass
-    # WEBHOOK_URL должен быть без токена, мы добавим токен при регистрации:
-    url = WEBHOOK_URL.rstrip("/") + "/" + TOKEN
-    res = bot.set_webhook(url=url)
-    print("Webhook set result:", res, "to", url)
+# --- Set webhook (remove previous, set new) ---
+# IMPORTANT: WEBHOOK_URL must be accessible and valid for Telegram (https).
+try:
+    bot.remove_webhook()
+    # small sleep to ensure Telegram processes remove_webhook
+    time.sleep(0.5)
+    bot.set_webhook(url=WEBHOOK_URL)
+    print("Webhook set to:", WEBHOOK_URL)
+except Exception as e:
+    print("Error setting webhook:", e)
 
+# --- Run Flask ---
 if __name__ == "__main__":
-    # Ensure data file exists
-    load_data()
-    setup_webhook()
-    port = int(os.getenv("PORT", 5000))
-    # Run Flask
-    app.run(host="0.0.0.0", port=port)
+    # Render will run the app. On local run:
+    server.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
