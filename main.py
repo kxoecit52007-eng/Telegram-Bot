@@ -1,129 +1,112 @@
 import os
 import telebot
 from flask import Flask, request
-from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 
-# ================= ENVIRONMENT VARS =================
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-OWNER_ID = int(os.getenv("OWNER_ID"))
-RENDER_URL = os.getenv("RENDER_URL")  # https://yourname.onrender.com
+TOKEN = os.getenv("BOT_TOKEN")
+OWNER_ID = int(os.getenv("OWNER_ID"))  # твой Telegram ID
+WEBHOOK_URL = os.getenv("WEBHOOK_URL")  # https://имя.onrender.com/webhook
 
-bot = telebot.TeleBot(BOT_TOKEN, threaded=False)
-app = Flask(__name__)
+bot = telebot.TeleBot(TOKEN)
+allowed_users = {OWNER_ID}  # изначально доступ есть только у владельца
 
-# ================= USER ACCESS STORAGE =================
-users = set()
-allowed_users = set([OWNER_ID])  # изначальный доступ только у владельца
-
-
-def is_allowed(uid):
-    return uid in allowed_users or uid == OWNER_ID
-
-
-# ================= HANDLERS =================
-
-@bot.message_handler(commands=["start"])
+# === Команда старт ===
+@bot.message_handler(commands=['start'])
 def start(message):
-    user_id = message.from_user.id
-    users.add(user_id)
-
-    if not is_allowed(user_id):
-        return bot.send_message(
-            user_id, "⛔ У вас нет доступа к боту.\nЗапросите доступ у администратора."
+    if message.from_user.id not in allowed_users:
+        return bot.reply_to(message,
+            "⚠ У вас нет доступа к этому боту.\n"
+            "Свяжитесь с владельцем чтобы получить доступ."
         )
-    bot.send_message(user_id, "Добро пожаловать! Доступ подтверждён 🔓")
 
+    bot.reply_to(message, "👋 Добро пожаловать! Вы авторизованы.\n/menu — открыть меню.")
 
-@bot.message_handler(commands=["admin"])
-def admin_panel(message):
+# === Меню ===
+@bot.message_handler(commands=['menu'])
+def menu(message):
     if message.from_user.id != OWNER_ID:
-        return bot.send_message(message.chat.id, "⛔ Вы не администратор.")
+        return bot.reply_to(message, "❌ Доступ запрещён.")
 
-    markup = InlineKeyboardMarkup()
-    markup.row(
-        InlineKeyboardButton("📊 Статистика", callback_data="stats"),
-        InlineKeyboardButton("📢 Рассылка", callback_data="broadcast")
+    text = (
+        "🔐 *Админ-панель*\n\n"
+        "Команды:\n"
+        "`/add ID` — выдать доступ\n"
+        "`/remove ID` — убрать доступ\n"
+        "`/users` — список пользователей\n"
+        "`/broadcast текст` — рассылка\n"
     )
-    markup.row(
-        InlineKeyboardButton("➕ Выдать доступ", callback_data="grant_access"),
-        InlineKeyboardButton("❌ Забрать доступ", callback_data="remove_access")
-    )
-    markup.row(InlineKeyboardButton("👥 Список пользователей", callback_data="list_users"))
-    bot.send_message(message.chat.id, "Админ-панель ⚙️", reply_markup=markup)
+    bot.reply_to(message, text, parse_mode="Markdown")
 
+# === Добавить пользователя ===
+@bot.message_handler(commands=['add'])
+def add_user(message):
+    if message.from_user.id != OWNER_ID:
+        return
 
-@bot.callback_query_handler(func=lambda call: True)
-def callback_handler(call):
-    uid = call.from_user.id
-    if uid != OWNER_ID:
-        return bot.answer_callback_query(call.id, "⛔ Нет доступа")
+    try:
+        user_id = int(message.text.split()[1])
+        allowed_users.add(user_id)
+        bot.reply_to(message, f"✅ Пользователь {user_id} получил доступ.")
+    except:
+        bot.reply_to(message, "Использование: /add USER_ID")
 
-    if call.data == "stats":
-        bot.send_message(uid, f"📊 Всего пользователей: {len(users)}\n🔑 Имеют доступ: {len(allowed_users)}")
+# === Удалить пользователя ===
+@bot.message_handler(commands=['remove'])
+def remove_user(message):
+    if message.from_user.id != OWNER_ID:
+        return
 
-    elif call.data == "list_users":
-        if users:
-            bot.send_message(uid, "👥 Пользователи:\n" + "\n".join(str(u) for u in users))
-        else:
-            bot.send_message(uid, "Нет зарегистрированных пользователей.")
+    try:
+        user_id = int(message.text.split()[1])
+        allowed_users.discard(user_id)
+        bot.reply_to(message, f"❌ Пользователь {user_id} удалён из доступа.")
+    except:
+        bot.reply_to(message, "Использование: /remove USER_ID")
 
-    elif call.data == "broadcast":
-        msg = bot.send_message(uid, "Введите текст рассылки:")
-        bot.register_next_step_handler(msg, do_broadcast)
+# === Список пользователей ===
+@bot.message_handler(commands=['users'])
+def show_users(message):
+    if message.from_user.id != OWNER_ID:
+        return
 
-    elif call.data == "grant_access":
-        msg = bot.send_message(uid, "Введите ID пользователя, которому дать доступ:")
-        bot.register_next_step_handler(msg, grant_access)
+    if not allowed_users:
+        return bot.reply_to(message, "Список пуст.")
 
-    elif call.data == "remove_access":
-        msg = bot.send_message(uid, "Введите ID пользователя, у которого забрать доступ:")
-        bot.register_next_step_handler(msg, remove_access)
+    text = "👥 Пользователи с доступом:\n" + "\n".join(str(u) for u in allowed_users)
+    bot.reply_to(message, text)
 
+# === Рассылка ===
+@bot.message_handler(commands=['broadcast'])
+def broadcast(message):
+    if message.from_user.id != OWNER_ID:
+        return
 
-def do_broadcast(message):
-    text = message.text
-    for uid in users:
+    parts = message.text.split(maxsplit=1)
+    if len(parts) < 2:
+        return bot.reply_to(message, "Использование: /broadcast текст")
+
+    text = parts[1]
+    for user in allowed_users:
         try:
-            bot.send_message(uid, text)
+            bot.send_message(user, text)
         except:
             pass
-    bot.send_message(message.from_user.id, "📢 Рассылка отправлена!")
 
+    bot.reply_to(message, "📨 Рассылка завершена.")
 
-def grant_access(message):
-    try:
-        uid = int(message.text)
-        allowed_users.add(uid)
-        bot.send_message(message.chat.id, f"Пользователь {uid} теперь имеет доступ 🔓")
-    except:
-        bot.send_message(message.chat.id, "❗ Ошибка: неверный ID")
+# === Flask сервер ===
+app = Flask(__name__)
 
-
-def remove_access(message):
-    try:
-        uid = int(message.text)
-        if uid == OWNER_ID:
-            return bot.send_message(message.chat.id, "❗ Нельзя удалить владельца")
-        allowed_users.discard(uid)
-        bot.send_message(message.chat.id, f"Доступ пользователя {uid} удалён ⛔")
-    except:
-        bot.send_message(message.chat.id, "❗ Ошибка: неверный ID")
-
-
-# ================= WEBHOOK =================
-
-@app.route("/" + BOT_TOKEN, methods=["POST"])
+@app.route('/webhook', methods=['POST'])
 def webhook():
-    bot.process_new_updates([telebot.types.Update.de_json(request.data.decode("utf-8"))])
-    return "OK", 200
+    update = telebot.types.Update.de_json(request.get_data().decode("utf-8"))
+    bot.process_new_updates([update])
+    return "ok", 200
 
-
-@app.route("/")
-def index():
-    return "Telegram bot is running!", 200
-
-
+# === Запуск ===
 if __name__ == "__main__":
+    print("Starting bot with webhook...")
     bot.remove_webhook()
-    bot.set_webhook(url=f"{RENDER_URL}/{BOT_TOKEN}")
-    app.run(host="0.0.0.0", port=10000)
+    bot.set_webhook(url=WEBHOOK_URL)
+
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host="0.0.0.0", port=port)
