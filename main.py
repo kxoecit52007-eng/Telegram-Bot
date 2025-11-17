@@ -353,3 +353,15 @@ else:
     # when loaded by gunicorn on Render
     init_db()
     set_webhook()
+
+# --- Webhook endpoints ---
+@app.get("/")
+async def home():
+    return {"status": "Bot is running"}
+
+@app.post("/webhook")
+async def webhook(request: Request):
+    data = await request.json()
+    update = Update.de_json(data, bot)
+    dispatcher.process_update(update)
+    return {"ok": True}
