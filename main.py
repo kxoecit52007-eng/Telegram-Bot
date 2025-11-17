@@ -1,215 +1,140 @@
+import logging
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, CallbackQueryHandler, ContextTypes, filters
 import os
-from flask import Flask, request
-from telegram import Update, Bot, ReplyKeyboardMarkup, KeyboardButton
-from telegram.ext import Dispatcher, CommandHandler, MessageHandler, Filters, CallbackContext
 
-# =============================
-# 🔧 ENV CONFIG
-# =============================
-TOKEN = os.getenv("BOT_TOKEN")
-WEBHOOK_URL = os.getenv("WEBHOOK_URL")  # https://your-app.onrender.com/webhook
-ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
+TOKEN = os.getenv("BOT_TOKEN")  # токен из Render
+ADMIN_ID = int(os.getenv("ADMIN_ID", "123456789"))  # твой Telegram ID
+WEBHOOK_URL = os.getenv("WEBHOOK_URL")  # URL Render
 
-if not TOKEN:
-    raise Exception("❌ BOT_TOKEN отсутствует в переменных окружения!")
+# Хранилище ключей и активных пользователей (можно заменить на БД)
+access_keys = {"TEST-123": True}
+allowed_users = set()
 
-bot = Bot(token=TOKEN)
+# Логирование
+logging.basicConfig(level=logging.INFO)
 
-# =============================
-# 📦 Хранилище данных
-# =============================
-users = set()          # ID пользователей с доступом
-keys = {}              # ключи: key -> attempts_left
-MAX_ATTEMPTS = 3       # попыток на ключ
+# Главное меню
+def main_menu():
+    keyboard = [
+        [InlineKeyboardButton("📌 Моя панель", callback_data="panel")],
+        [InlineKeyboardButton("🔑 Ввести ключ", callback_data="key")],
+    ]
+    return InlineKeyboardMarkup(keyboard)
 
-# =============================
-# 🎛 Кнопочные меню
-# =============================
-def user_menu():
-    return ReplyKeyboardMarkup([
-        [KeyboardButton("🔑 Ввести ключ")],
-        [KeyboardButton("ℹ О боте")],
-    ], resize_keyboard=True)
-
+# Админ меню
 def admin_menu():
-    return ReplyKeyboardMarkup([
-        [KeyboardButton("🔑 Ввести ключ")],
-        [KeyboardButton("📢 Рассылка"), KeyboardButton("👥 Пользователи")],
-        [KeyboardButton("➕ Добавить ключ"), KeyboardButton("🗑 Удалить ключ")],
-        [KeyboardButton("ℹ О боте")],
-    ], resize_keyboard=True)
+    keyboard = [
+        [InlineKeyboardButton("👥 Пользователи", callback_data="users")],
+        [InlineKeyboardButton("📨 Рассылка", callback_data="broadcast")],
+        [InlineKeyboardButton("➕ Добавить ключ", callback_data="add_key")],
+    ]
+    return InlineKeyboardMarkup(keyboard)
 
-# =============================
-# 🛠 Flask APP
-# =============================
-app = Flask(__name__)
-dispatcher = Dispatcher(bot, None, workers=0)
 
-# =============================
-# 👋 Приветствие
-# =============================
-def start(update: Update, context: CallbackContext):
-    user_id = update.effective_user.id
+# ====================== Команды ======================
 
-    if user_id in users:
-        menu = admin_menu() if user_id == ADMIN_ID else user_menu()
-        update.message.reply_text(
-            "🔓 Добро пожаловать! Доступ активен.\nВыберите действие:",
-            reply_markup=menu
-        )
-    else:
-        update.message.reply_text(
-            "👋 Добро пожаловать!\n\n"
-            "🔐 Чтобы получить доступ, нажмите кнопку ниже и введите ключ:",
-            reply_markup=user_menu()
-        )
-
-# =============================
-# ℹ О боте
-# =============================
-def about(update: Update, context: CallbackContext):
-    update.message.reply_text(
-        "🤖 MetaSnos Bot\n\n"
-        "Бот с приватным доступом по ключам.\n"
-        "Функционал доступен только одобренным пользователям. 🔐"
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "👋 Привет! Добро пожаловать в закрытую систему доступа.\n"
+        "Чтобы пользоваться ботом — введи ключ доступа 🔑",
+        reply_markup=main_menu()
     )
 
-# =============================
-# 🔑 Обработка ключей
-# =============================
-def process_key(update: Update, context: CallbackContext):
-    user_id = update.effective_user.id
-    text = update.message.text.strip()
+async def admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message.from_user.id != ADMIN_ID:
+        return await update.message.reply_text("⛔ Нет доступа!")
 
-    if user_id in users:
-        return update.message.reply_text("🎉 У вас уже есть доступ!")
+    await update.message.reply_text("👑 Админ панель:", reply_markup=admin_menu())
 
-    if text not in keys:
-        return update.message.reply_text("❌ Неверный ключ, попробуйте снова.")
 
-    if keys[text] <= 0:
-        return update.message.reply_text("🚫 У этого ключа больше нет попыток.")
+# ==================== Обработка Кнопок ====================
 
-    keys[text] -= 1
-    users.add(user_id)
-    update.message.reply_text("🔓 Доступ успешно выдан! Поздравляю 🎉", reply_markup=user_menu())
+async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
 
-# =============================
-# 🧰 ADMIN Ограничение
-# =============================
-def admin_only(func):
-    def wrapper(update: Update, context: CallbackContext):
-        if update.effective_user.id != ADMIN_ID:
-            return update.message.reply_text("⛔ У вас нет прав администратора.")
-        return func(update, context)
-    return wrapper
+    uid = query.from_user.id
 
-# =============================
-# 👥 ADMIN: список пользователей
-# =============================
-@admin_only
-def list_users(update: Update, context: CallbackContext):
-    if not users:
-        return update.message.reply_text("👤 Пока нет пользователей.")
-    update.message.reply_text("👥 Пользователи:\n" + "\n".join(map(str, users)))
+    # Ввести ключ
+    if query.data == "key":
+        context.user_data["await_key"] = True
+        return await query.edit_message_text("🔑 Введи ключ:")
 
-# =============================
-# ➕ ADMIN: добавить ключ
-# =============================
-@admin_only
-def add_key(update: Update, context: CallbackContext):
-    try:
-        key = context.args[0]
-        keys[key] = MAX_ATTEMPTS
-        update.message.reply_text(f"🔑 Ключ '{key}' добавлен.")
-    except:
-        update.message.reply_text("⚠ Использование: /add_key ключ")
+    # Панель пользователя
+    if query.data == "panel":
+        if uid not in allowed_users:
+            return await query.edit_message_text("⛔ У тебя нет доступа. Введи ключ.")
+        return await query.edit_message_text("📌 Твоя панель. Функции будут тут позже.")
 
-# =============================
-# 🗑 ADMIN: удалить ключ
-# =============================
-@admin_only
-def del_key(update: Update, context: CallbackContext):
-    try:
-        key = context.args[0]
-        if key in keys:
-            del keys[key]
-            update.message.reply_text(f"🗑 Ключ '{key}' удалён.")
-        else:
-            update.message.reply_text("❌ Нет такого ключа.")
-    except:
-        update.message.reply_text("⚠ Использование: /del_key ключ")
+    # Админ кнопки
+    if uid == ADMIN_ID:
 
-# =============================
-# 📢 ADMIN: рассылка
-# =============================
-@admin_only
-def broadcast(update: Update, context: CallbackContext):
-    text = " ".join(context.args)
-    if not text:
-        return update.message.reply_text("⚠ Использование: /broadcast текст")
+        if query.data == "users":
+            return await query.edit_message_text(f"👥 Пользователи:\n{allowed_users}")
 
-    sent = 0
-    for uid in users:
-        try:
-            bot.send_message(uid, f"📢 Объявление администратора:\n\n{text}")
-            sent += 1
-        except:
-            pass
-    update.message.reply_text(f"📨 Рассылка завершена. Отправлено: {sent}")
+        if query.data == "add_key":
+            context.user_data["await_new_key"] = True
+            return await query.edit_message_text("Введите новый ключ для добавления:")
 
-# =============================
-# 🧠 Обработка текстовых кнопок
-# =============================
-def text_router(update: Update, context: CallbackContext):
+        if query.data == "broadcast":
+            context.user_data["await_broadcast"] = True
+            return await query.edit_message_text("Введите текст рассылки:")
+
+    else:
+        return await query.edit_message_text("⛔ Нет доступа!")
+
+
+# ==================== Сообщения текста ====================
+
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
+    uid = update.message.from_user.id
 
-    if text == "ℹ О боте":
-        return about(update, context)
+    # Обработка ключа
+    if context.user_data.get("await_key"):
+        context.user_data["await_key"] = False
 
-    if text == "🔑 Ввести ключ":
-        return update.message.reply_text("Введите ключ:")
+        if text in access_keys:
+            allowed_users.add(uid)
+            return await update.message.reply_text("🔓 Доступ открыт! Можешь пользоваться ботом.", reply_markup=main_menu())
+        else:
+            return await update.message.reply_text("⛔ Неверный ключ!")
 
-    if text == "📢 Рассылка" and update.effective_user.id == ADMIN_ID:
-        return update.message.reply_text("Введите сообщение:\n\n/broadcast текст")
+    # Добавление ключа админом
+    if context.user_data.get("await_new_key") and uid == ADMIN_ID:
+        context.user_data["await_new_key"] = False
+        access_keys[text] = True
+        return await update.message.reply_text(f"✅ Новый ключ добавлен: {text}")
 
-    if text == "👥 Пользователи" and update.effective_user.id == ADMIN_ID:
-        return list_users(update, context)
+    # Рассылка
+    if context.user_data.get("await_broadcast") and uid == ADMIN_ID:
+        context.user_data["await_broadcast"] = False
+        msg = text
+        for user in allowed_users:
+            try:
+                await context.bot.send_message(user, f"📢 Рассылка:\n{msg}")
+            except:
+                pass
+        return await update.message.reply_text("📨 Рассылка завершена!")
 
-    if text == "➕ Добавить ключ" and update.effective_user.id == ADMIN_ID:
-        return update.message.reply_text("Использование:\n/add_key ключ")
+    await update.message.reply_text("Не понимаю, воспользуйся меню ↓", reply_markup=main_menu())
 
-    if text == "🗑 Удалить ключ" and update.effective_user.id == ADMIN_ID:
-        return update.message.reply_text("Использование:\n/del_key ключ")
 
-    return process_key(update, context)
+# ==================== Запуск Webhook ====================
 
-# =============================
-# Handlers
-# =============================
-dispatcher.add_handler(CommandHandler("start", start))
-dispatcher.add_handler(CommandHandler("add_key", add_key))
-dispatcher.add_handler(CommandHandler("del_key", del_key))
-dispatcher.add_handler(CommandHandler("users", list_users))
-dispatcher.add_handler(CommandHandler("broadcast", broadcast))
-dispatcher.add_handler(MessageHandler(Filters.text & ~Filters.command, text_router))
+async def main():
+    app = ApplicationBuilder().token(TOKEN).build()
 
-# =============================
-# 🌐 Webhook endpoint
-# =============================
-@app.route("/webhook", methods=["POST"])
-def webhook():
-    update = Update.de_json(request.get_json(), bot)
-    dispatcher.process_update(update)
-    return "OK", 200
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("admin", admin))
+    app.add_handler(CallbackQueryHandler(callbacks))
+    app.add_handler(MessageHandler(filters.TEXT, handle_text))
 
-if WEBHOOK_URL:
-    bot.set_webhook(WEBHOOK_URL)
-    print("Webhook установлен:", WEBHOOK_URL)
-
-@app.route("/")
-def home():
-    return "Bot running!", 200
+    await app.start()
+    await app.bot.set_webhook(WEBHOOK_URL)
+    await app.idle()
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)))
+    import asyncio
+    asyncio.run(main())
