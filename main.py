@@ -1,71 +1,30 @@
 import os
 import telebot
+from flask import Flask, request
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
+TOKEN = os.getenv("BOT_TOKEN")
+OWNER_ID = int(os.getenv("OWNER_ID"))
 
-bot = telebot.TeleBot(BOT_TOKEN)
+bot = telebot.TeleBot(TOKEN)
+server = Flask(__name__)
 
-# ID владельца (ты)
-OWNER_ID = 8253247804
-
-# Здесь храним разрешённых пользователей
-allowed_users = {OWNER_ID}
-
-def is_allowed(user_id):
-    return user_id in allowed_users or user_id == OWNER_ID
-
-
-# Команда /start
 @bot.message_handler(commands=['start'])
 def start(message):
-    user_id = message.from_user.id
-    
-    if not is_allowed(user_id):
-        bot.reply_to(message, "⛔ У вас нет доступа к этому боту.")
-        return
-    
-    bot.reply_to(message, "🔐 Добро пожаловать! У вас есть доступ к функциям бота.")
-
-
-# Команда /adduser <id> — только для владельца
-@bot.message_handler(commands=['adduser'])
-def add_user(message):
     if message.from_user.id != OWNER_ID:
-        return bot.reply_to(message, "⛔ Команда доступна только владельцу.")
+        return bot.reply_to(message, "⛔ У вас нет доступа к функциям бота.")
+    bot.reply_to(message, "🔥 Привет, владелец! Бот работает 24/7 через webhook!")
 
-    try:
-        new_id = int(message.text.split()[1])
-        allowed_users.add(new_id)
-        bot.reply_to(message, f"✔ Пользователь {new_id} добавлен в список доступа.")
-    except:
-        bot.reply_to(message, "❗ Использование: /adduser <id>")
+@server.route('/' + TOKEN, methods=['POST'])
+def getMessage():
+    bot.process_new_updates([telebot.types.Update.de_json(request.stream.read().decode("utf-8"))])
+    return "OK", 200
 
-
-# Команда /deluser <id> — только для владельца
-@bot.message_handler(commands=['deluser'])
-def del_user(message):
-    if message.from_user.id != OWNER_ID:
-        return bot.reply_to(message, "⛔ Команда только для владельца.")
-    
-    try:
-        remove_id = int(message.text.split()[1])
-        if remove_id in allowed_users:
-            allowed_users.remove(remove_id)
-            bot.reply_to(message, f"❌ Пользователь {remove_id} удалён из доступа.")
-        else:
-            bot.reply_to(message, "Пользователь и так не имел доступа.")
-    except:
-        bot.reply_to(message, "❗ Использование: /deluser <id>")
+@server.route("/")
+def webhook():
+    bot.remove_webhook()
+    bot.set_webhook(url=f"{os.getenv('RENDER_EXTERNAL_URL')}/{TOKEN}")
+    return "Webhook set", 200
 
 
-# Любой другой текст — только если есть доступ
-@bot.message_handler(func=lambda m: True)
-def main_logic(message):
-    if not is_allowed(message.from_user.id):
-        return bot.reply_to(message, "⛔ У вас нет доступа.")
-    
-    bot.reply_to(message, f"🟢 Вы можете пользоваться ботом.\nВаш текст: {message.text}")
-
-
-print("Bot started...")
-bot.infinity_polling()
+if __name__ == "__main__":
+    server.run(host="0.0.0.0", port=10000)
