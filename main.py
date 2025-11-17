@@ -1,233 +1,301 @@
+  # main.py
 import os
+import json
 import time
-import telebot
-from telebot.types import Message
+import secrets
+from datetime import datetime, timezone, timedelta
 from flask import Flask, request
+import telebot
 
-# ====== CONFIG ======
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-WEBHOOK_URL = os.getenv("WEBHOOK_URL")
+# --- Config from ENV ---
+TOKEN = os.getenv("BOT_TOKEN")
+WEBHOOK_URL = os.getenv("WEBHOOK_URL", "").rstrip("/")  # без завершающего /
+OWNER_ID = str(os.getenv("OWNER_ID", "")).strip()
 
-OWNER_ID = 8253247804
-ACCESS_PASSWORD = "MetaSnos"     # постоянный ключ доступа
-MAX_ATTEMPTS = 5                 # попытки для ввода ключа/пароля
-BLOCK_TIME = 60 * 15             # блокировка 15 минут
+if not TOKEN:
+    raise RuntimeError("BOT_TOKEN is not set in environment variables.")
+if not WEBHOOK_URL:
+    raise RuntimeError("WEBHOOK_URL is not set in environment variables.")
+if not OWNER_ID:
+    raise RuntimeError("OWNER_ID is not set in environment variables.")
 
-bot = telebot.TeleBot(BOT_TOKEN)
-server = Flask(__name__)
+DATA_FILE = "data.json"
 
-# ====== STORAGE ======
-allowed_users = set([OWNER_ID])
-temp_keys = {}          # {ключ: expire_time}
-used_keys = set()       # уже использованные ключи
-failed_attempts = {}    # {user_id: [attempt_count, block_until_time]}
+# --- Telebot + Flask ---
+bot = telebot.TeleBot(TOKEN)
+app = Flask(__name__)
 
+# --- Helpers: persistent storage for admins / keys / allowed users ---
+def load_data():
+    if not os.path.exists(DATA_FILE):
+        # initial structure
+        data = {
+            "admins": [OWNER_ID],       # list of user ids as strings
+            "allowed": {},              # user_id -> expiry_ts (int epoch)
+            "keys": {}                  # key -> {expires:ts, max_uses:int, uses:int, used_by:[], issued_by:id}
+        }
+        save_data(data)
+        return data
+    with open(DATA_FILE, "r", encoding="utf-8") as f:
+        return json.load(f)
 
-# ====== UTILS ======
+def save_data(data):
+    with open(DATA_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
 
-def generate_key(length=12):
-    import random, string
-    chars = string.ascii_letters + string.digits
-    return ''.join(random.choice(chars) for _ in range(length))
+def is_admin(user_id):
+    data = load_data()
+    return str(user_id) in data.get("admins", [])
 
-
-def cleanup_temp_keys():
-    now = time.time()
-    expired = [k for k, exp in temp_keys.items() if exp < now]
-    for k in expired:
-        del temp_keys[k]
-
-
-def is_blocked(user_id):
-    """Проверка, заблокирован ли пользователь за перебор ключей"""
-    if user_id not in failed_attempts:
+def is_allowed(user_id):
+    data = load_data()
+    user_id = str(user_id)
+    expiry = data.get("allowed", {}).get(user_id)
+    if not expiry:
         return False
+    return int(expiry) > int(time.time())
 
-    attempts, block_until = failed_attempts[user_id]
-    if block_until and block_until > time.time():
+def grant_temporary_access(user_id, minutes):
+    data = load_data()
+    expiry_ts = int(time.time()) + int(minutes) * 60
+    data.setdefault("allowed", {})[str(user_id)] = expiry_ts
+    save_data(data)
+    return expiry_ts
+
+def revoke_access(user_id):
+    data = load_data()
+    if str(user_id) in data.get("allowed", {}):
+        del data["allowed"][str(user_id)]
+        save_data(data)
         return True
-
     return False
 
+# --- Key generation / usage ---
+def create_key(ttl_minutes=60, max_uses=1, issued_by=None):
+    data = load_data()
+    key = secrets.token_urlsafe(12)
+    data.setdefault("keys", {})[key] = {
+        "expires": int(time.time()) + int(ttl_minutes) * 60,
+        "max_uses": int(max_uses),
+        "uses": 0,
+        "used_by": [],
+        "issued_by": str(issued_by) if issued_by else None
+    }
+    save_data(data)
+    return key
 
-def register_fail(user_id):
-    """Регистрирует ошибку ввода ключа/пароля"""
-    now = time.time()
-    if user_id not in failed_attempts:
-        failed_attempts[user_id] = [1, None]
-        return MAX_ATTEMPTS - 1
+def use_key(key, user_id):
+    data = load_data()
+    entry = data.get("keys", {}).get(key)
+    now = int(time.time())
+    if not entry:
+        return (False, "Key not found.")
+    if entry["expires"] < now:
+        return (False, "Key expired.")
+    if str(user_id) in entry.get("used_by", []):
+        return (False, "You already used this key.")
+    if entry["uses"] >= entry["max_uses"]:
+        return (False, "Key has no remaining uses.")
+    # Accept usage
+    entry["uses"] += 1
+    entry.setdefault("used_by", []).append(str(user_id))
+    save_data(data)
+    return (True, "Key accepted.")
 
-    attempts, block_until = failed_attempts[user_id]
-
-    if block_until and block_until > now:
-        return 0  # уже заблокирован
-
-    attempts += 1
-    if attempts >= MAX_ATTEMPTS:
-        failed_attempts[user_id] = [attempts, now + BLOCK_TIME]
-        return 0
-    else:
-        failed_attempts[user_id] = [attempts, None]
-        return MAX_ATTEMPTS - attempts
-
-
-def clear_fail(user_id):
-    if user_id in failed_attempts:
-        del failed_attempts[user_id]
-
-
-# ====== COMMANDS ======
-
+# --- Commands handlers ---
 @bot.message_handler(commands=['start'])
-def start(message: Message):
-    cleanup_temp_keys()
-    user_id = message.from_user.id
+def cmd_start(message):
+    bot.reply_to(message, "Привет! Это бот с системой доступа. Используй /help для списка команд.")
 
-    if user_id not in allowed_users:
-        bot.reply_to(message, "🚫 У вас нет доступа.\nВведите пароль или ключ:")
-        return
-
-    bot.reply_to(message, "👋 Добро пожаловать! Меню: /menu")
-
-
-@bot.message_handler(commands=['menu'])
-def menu(message: Message):
-    if message.from_user.id not in allowed_users:
-        return
-    bot.reply_to(message,
-        "📌 Команды:\n"
-        "/admin — админ панель\n"
-        "/key — постоянный доступ\n"
-        "/tempkey <минут> — временный ключ\n"
+@bot.message_handler(commands=['help'])
+def cmd_help(message):
+    help_text = (
+        "/help - этот текст\n"
+        "/status - проверить ваш доступ\n"
+        "/usekey <key> - активировать ключ доступа\n"
+        "/key - (admins) сгенерировать временный ключ: /key <minutes> <max_uses>\n"
+        "/grant <user_id> <minutes> - (admins) выдать доступ пользователю на минуты\n"
+        "/revoke <user_id> - (admins) забрать доступ\n"
+        "/addadmin <user_id> - (owner only) добавить администратора\n"
+        "/removeadmin <user_id> - (owner only) убрать администратора\n"
+        "/admin - открыть краткую админ-панель (текстовая)\n"
     )
+    bot.reply_to(message, help_text)
 
+@bot.message_handler(commands=['status'])
+def cmd_status(message):
+    uid = str(message.from_user.id)
+    if is_allowed(uid):
+        expiry = load_data()["allowed"][uid]
+        dt = datetime.fromtimestamp(int(expiry), tz=timezone.utc).astimezone()
+        bot.reply_to(message, f"У вас есть доступ до: {dt.isoformat()}")
+    else:
+        bot.reply_to(message, "У вас сейчас нет доступа. Получите ключ у администратора или используйте /usekey <key>")
+
+@bot.message_handler(commands=['usekey'])
+def cmd_usekey(message):
+    parts = message.text.strip().split()
+    if len(parts) < 2:
+        bot.reply_to(message, "Использование: /usekey <key>")
+        return
+    key = parts[1].strip()
+    ok, info = use_key(key, message.from_user.id)
+    if not ok:
+        bot.reply_to(message, f"Ключ не подошёл: {info}")
+        return
+    # при успешном использовании даём временный доступ, например 60 минут по умолчанию
+    expiry_ts = int(time.time()) + 60*60
+    data = load_data()
+    data.setdefault("allowed", {})[str(message.from_user.id)] = expiry_ts
+    save_data(data)
+    dt = datetime.fromtimestamp(expiry_ts, tz=timezone.utc).astimezone()
+    bot.reply_to(message, f"Ключ принят. У вас доступ до {dt.isoformat()}")
 
 @bot.message_handler(commands=['admin'])
-def admin(message: Message):
-    if message.from_user.id != OWNER_ID:
-        bot.reply_to(message, "⛔ Нет прав.")
+def cmd_admin(message):
+    uid = str(message.from_user.id)
+    if not is_admin(uid) and uid != OWNER_ID:
+        bot.reply_to(message, "Только администраторы могут использовать эти команды.")
         return
-
-    bot.reply_to(message,
-        "🔐 *Админ-панель:*\n"
-        "/access <id> — выдать доступ\n"
-        "/revoke <id> — удалить доступ\n"
-        "/users — показать пользователей\n"
-        "/tempkey <минут> — временный ключ\n",
-        parse_mode="Markdown"
+    text = (
+        "Админ-панель (текстовая):\n"
+        "/key <minutes> <max_uses> - создать ключ\n"
+        "/grant <user_id> <minutes> - выдать доступ\n"
+        "/revoke <user_id> - отозвать доступ\n"
+        "/addadmin <user_id> - добавить администратора (owner only)\n"
+        "/removeadmin <user_id> - убрать администратора (owner only)\n"
     )
-
-
-@bot.message_handler(commands=['users'])
-def users(message: Message):
-    if message.from_user.id != OWNER_ID:
-        return
-    text = "\n".join(str(uid) for uid in allowed_users)
-    bot.reply_to(message, f"📍 Пользователи:\n{text}")
-
-
-@bot.message_handler(commands=['access'])
-def access(message: Message):
-    if message.from_user.id != OWNER_ID:
-        return
-    try:
-        uid = int(message.text.split()[1])
-        allowed_users.add(uid)
-        bot.reply_to(message, f"✅ Доступ выдан {uid}")
-    except:
-        bot.reply_to(message, "Использование: /access <id>")
-
-
-@bot.message_handler(commands=['revoke'])
-def revoke(message: Message):
-    if message.from_user.id != OWNER_ID:
-        return
-    try:
-        uid = int(message.text.split()[1])
-        if uid in allowed_users:
-            allowed_users.remove(uid)
-            bot.reply_to(message, f"🚫 Доступ отозван у {uid}")
-        else:
-            bot.reply_to(message, "Пользователь не найден.")
-    except:
-        bot.reply_to(message, "Использование: /revoke <id>")
-
+    bot.reply_to(message, text)
 
 @bot.message_handler(commands=['key'])
-def key(message: Message):
-    if message.from_user.id != OWNER_ID:
-        bot.reply_to(message, "⛔ Нет прав.")
+def cmd_key(message):
+    uid = str(message.from_user.id)
+    if not is_admin(uid) and uid != OWNER_ID:
+        bot.reply_to(message, "Только администраторы могут выдавать ключи.")
         return
-    bot.reply_to(message, f"🔑 Постоянный ключ:\n`{ACCESS_PASSWORD}`", parse_mode="Markdown")
-
-
-@bot.message_handler(commands=['tempkey'])
-def tempkey(message: Message):
-    if message.from_user.id != OWNER_ID:
-        bot.reply_to(message, "⛔ Нет прав.")
+    parts = message.text.strip().split()
+    if len(parts) < 2:
+        bot.reply_to(message, "Использование: /key <minutes> [max_uses]\nПример: /key 60 1")
         return
-    try:
-        minutes = int(message.text.split()[1])
-        expire = time.time() + minutes * 60
-        key = generate_key()
-        temp_keys[key] = expire
-        bot.reply_to(message, f"⏳ Временный ключ на {minutes} мин:\n`{key}`", parse_mode="Markdown")
-    except:
-        bot.reply_to(message, "Использование: /tempkey <минут>")
+    minutes = int(parts[1])
+    max_uses = int(parts[2]) if len(parts) >= 3 else 1
+    key = create_key(ttl_minutes=minutes, max_uses=max_uses, issued_by=uid)
+    bot.reply_to(message, f"Ключ: `{key}`\nДействует {minutes} мин, max uses: {max_uses}", parse_mode='Markdown')
 
-
-# ====== PASSWORD / KEY LOGIN ======
-
-@bot.message_handler(func=lambda m: True)
-def login(message: Message):
-    cleanup_temp_keys()
-    user_id = message.from_user.id
-    text = message.text.strip()
-
-    if user_id in allowed_users:
-        clear_fail(user_id)
+@bot.message_handler(commands=['grant'])
+def cmd_grant(message):
+    uid = str(message.from_user.id)
+    if not is_admin(uid) and uid != OWNER_ID:
+        bot.reply_to(message, "Только администраторы могут выдавать доступ.")
         return
-
-    if is_blocked(user_id):
-        bot.reply_to(message, "⛔ Слишком много неверных попыток. Попробуйте позже.")
+    parts = message.text.strip().split()
+    if len(parts) < 3:
+        bot.reply_to(message, "Использование: /grant <user_id> <minutes>")
         return
+    target = parts[1]
+    minutes = int(parts[2])
+    expiry = grant_temporary_access(target, minutes)
+    dt = datetime.fromtimestamp(expiry, tz=timezone.utc).astimezone()
+    bot.reply_to(message, f"Выдан доступ пользователю {target} до {dt.isoformat()}")
 
-    # постоянный
-    if text == ACCESS_PASSWORD and text not in used_keys:
-        allowed_users.add(user_id)
-        used_keys.add(text)
-        clear_fail(user_id)
-        bot.reply_to(message, "🎉 Доступ получен! /start")
+@bot.message_handler(commands=['revoke'])
+def cmd_revoke(message):
+    uid = str(message.from_user.id)
+    if not is_admin(uid) and uid != OWNER_ID:
+        bot.reply_to(message, "Только администраторы могут отзывать доступ.")
         return
-
-    # временный
-    if text in temp_keys and text not in used_keys:
-        del temp_keys[text]
-        allowed_users.add(user_id)
-        used_keys.add(text)
-        clear_fail(user_id)
-        bot.reply_to(message, "🔓 Временный доступ активирован! /start")
+    parts = message.text.strip().split()
+    if len(parts) < 2:
+        bot.reply_to(message, "Использование: /revoke <user_id>")
         return
-
-    # неверный ввод
-    remaining = register_fail(user_id)
-    if remaining == 0:
-        bot.reply_to(message, "⛔ Вы заблокированы на 15 минут.")
+    target = parts[1]
+    ok = revoke_access(target)
+    if ok:
+        bot.reply_to(message, f"Доступ у {target} отозван.")
     else:
-        bot.reply_to(message, f"❌ Неверный ключ. Осталось попыток: {remaining}")
+        bot.reply_to(message, f"У {target} не было активного доступа.")
 
+@bot.message_handler(commands=['addadmin'])
+def cmd_addadmin(message):
+    if str(message.from_user.id) != OWNER_ID:
+        bot.reply_to(message, "Только владелец может добавлять админов.")
+        return
+    parts = message.text.strip().split()
+    if len(parts) < 2:
+        bot.reply_to(message, "Использование: /addadmin <user_id>")
+        return
+    target = parts[1]
+    data = load_data()
+    if target in data.get("admins", []):
+        bot.reply_to(message, f"{target} уже является админом.")
+        return
+    data.setdefault("admins", []).append(str(target))
+    save_data(data)
+    bot.reply_to(message, f"{target} добавлен в админы.")
 
-# ====== WEBHOOK ======
+@bot.message_handler(commands=['removeadmin'])
+def cmd_removeadmin(message):
+    if str(message.from_user.id) != OWNER_ID:
+        bot.reply_to(message, "Только владелец может удалять админов.")
+        return
+    parts = message.text.strip().split()
+    if len(parts) < 2:
+        bot.reply_to(message, "Использование: /removeadmin <user_id>")
+        return
+    target = parts[1]
+    data = load_data()
+    if target not in data.get("admins", []):
+        bot.reply_to(message, f"{target} не найден в списке админов.")
+        return
+    data["admins"].remove(target)
+    save_data(data)
+    bot.reply_to(message, f"{target} исключен из админов.")
 
-@server.route("/", methods=["POST"])
-def webhook():
-    bot.process_new_updates(
-        [telebot.types.Update.de_json(request.data.decode("utf-8"))]
-    )
+# --- Example: protect main functionality ---
+# Здесь можно добавить обработчик основного функционала бота, и разрешать только allowed users.
+@bot.message_handler(func=lambda m: True)
+def fallback(m):
+    # любой общий функционал — доступен только тем у кого есть разрешение
+    if is_allowed(m.from_user.id) or is_admin(str(m.from_user.id)) or str(m.from_user.id) == OWNER_ID:
+        # Тут оставить существующий функционал, например приветствие
+        if m.text and m.text.lower().startswith("hello") or m.text and "привет" in m.text.lower():
+            bot.reply_to(m, f"Привет, {m.from_user.first_name}! У тебя есть доступ.")
+        else:
+            bot.reply_to(m, "Команда не распознана. Используйте /help.")
+    else:
+        bot.reply_to(m, "У вас нет доступа к функциям бота. Получите ключ у администратора или используйте /usekey <key>")
+
+# --- Webhook routes ---
+@app.route('/' + TOKEN, methods=['POST'])
+def webhook_handler():
+    try:
+        json_string = request.get_data().decode('utf-8')
+        update = telebot.types.Update.de_json(json_string)
+        bot.process_new_updates([update])
+    except Exception as e:
+        # логируем, но не ломаем
+        print("Webhook error:", e)
     return "OK", 200
 
+@app.route('/')
+def index():
+    return "Bot is running!", 200
+
+# --- Setup webhook on start ---
+def setup_webhook():
+    try:
+        bot.remove_webhook()
+    except Exception:
+        pass
+    # WEBHOOK_URL должен быть без токена, мы добавим токен при регистрации:
+    url = WEBHOOK_URL.rstrip("/") + "/" + TOKEN
+    res = bot.set_webhook(url=url)
+    print("Webhook set result:", res, "to", url)
 
 if __name__ == "__main__":
-    bot.remove_webhook()
-    bot.set_webhook(url=WEBHOOK_URL)
-    server.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+    # Ensure data file exists
+    load_data()
+    setup_webhook()
+    port = int(os.getenv("PORT", 5000))
+    # Run Flask
+    app.run(host="0.0.0.0", port=port)
