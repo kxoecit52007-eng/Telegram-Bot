@@ -1,104 +1,110 @@
-import os
 import requests
-from fastapi import FastAPI, Request
-from dotenv import load_dotenv
-from database import init_db, add_user, activate_key, user_has_access, create_key, get_all_users
+import time
 
-load_dotenv()
-init_db()
+TOKEN = "8453302588:AAF3Yq8YeqYNeESsnZNGEmJL9MXGvKVIleo"
+API_URL = f"https://api.telegram.org/bot8453302588:AAF3Yq8YeqYNeESsnZNGEmJL9MXGvKVIleo/"
 
-BOT_TOKEN = os.getenv("BOT_TOKEN", "8453302588:AAF3Yq8YeqYNeESsnZNGEmJL9MXGvKVIleo")
-OWNER_ID = int(os.getenv("OWNER_ID", "8253247804"))  # твой ID
-API = f"https://api.telegram.org/bot8453302588:AAF3Yq8YeqYNeESsnZNGEmJL9MXGvKVIleo/"
+# ---- Функции ----
 
-app = FastAPI()
+def send_message(chat_id, text, reply_markup=None):
+    data = {"chat_id": chat_id, "text": text, "parse_mode": "HTML"}
+    if reply_markup:
+        data["reply_markup"] = reply_markup
+    requests.post(API_URL + "sendMessage", json=data)
 
+def get_user_profile(user_id):
+    r = requests.get(API_URL + f"getUserProfilePhotos?user_id={user_id}&limit=1").json()
+    try:
+        file_id = r["result"]["photos"][0][0]["file_id"]
+        return file_id
+    except:
+        return None
 
-def send_message(chat_id, text, keyboard=None):
-    data = {"chat_id": chat_id, "text": text}
-    if keyboard:
-        data["reply_markup"] = keyboard
-    requests.post(API + "sendMessage", json=data)
+def send_photo(chat_id, file_id, caption):
+    data = {"chat_id": chat_id, "photo": file_id, "caption": caption}
+    requests.post(API_URL + "sendPhoto", json=data)
 
+# ---- Главное меню ----
 
-def menu_keyboard():
-    return {
-        "keyboard": [
-            [{"text": "🔑 Активировать ключ"}],
-            [{"text": "ℹ Профиль"}]
-        ],
-        "resize_keyboard": True
-    }
+MAIN_MENU = {
+    "keyboard": [
+        ["Пожаловаться на аккаунт"],
+        ["Профиль"],
+        ["Подписка"]
+    ],
+    "resize_keyboard": True
+}
 
+# ---- Основной цикл ----
 
-def admin_keyboard():
-    return {
-        "keyboard": [
-            [{"text": "➕ Создать ключ"}],
-            [{"text": "📢 Рассылка"}]
-        ],
-        "resize_keyboard": True
-    }
+def main():
+    last_update = 0
+    print("Бот запущен!")
 
+    while True:
+        try:
+            updates = requests.get(API_URL + f"getUpdates?offset={last_update + 1}").json()
 
-@app.post("/webhook")
-async def webhook(request: Request):
-    data = await request.json()
+            for update in updates.get("result", []):
+                last_update = update["update_id"]
 
-    if "message" not in data:
-        return {"ok": True}
+                if "message" not in update:
+                    continue
 
-    msg = data["message"]
-    chat_id = msg["chat"]["id"]
-    text = msg.get("text", "")
-    user_id = msg["from"]["id"]
+                msg = update["message"]
+                chat_id = msg["chat"]["id"]
+                text = msg.get("text", "")
 
-    add_user(user_id)
+                # Приветствие + меню
+                if text == "/start":
+                    send_message(
+                        chat_id,
+                        "👋 Привет! Я бот MetaSnos.\nВыбери действие ниже:",
+                        reply_markup={"keyboard": MAIN_MENU["keyboard"], "resize_keyboard": True}
+                    )
+                    continue
 
-    # Команда старт
-    if text == "/start":
-        send_message(chat_id,
-                     "👋 Привет!\nДобро пожаловать в бота.\n\n"
-                     "Чтобы пользоваться функциями — активируй ключ 🔑",
-                     menu_keyboard())
-        return {"ok": True}
+                # --- Кнопки ---
+                if text == "Пожаловаться на аккаунт":
+                    send_message(chat_id, "⚠ Функция находится в разработке...")
+                    continue
 
-    # Админ панель
-    if user_id == OWNER_ID:
-        if text == "/admin":
-            send_message(chat_id, "👑 Админ панель", admin_keyboard())
-            return {"ok": True}
+                if text == "Подписка":
+                    send_message(chat_id, "💎 Раздел подписок скоро будет готов...")
+                    continue
 
-        if text == "➕ Создать ключ":
-            new_key = os.urandom(4).hex()
-            create_key(new_key)
-            send_message(chat_id, f"🔑 Ключ создан:\n`{new_key}`")
-            return {"ok": True}
+                if text == "Профиль":
+                    user = msg["from"]
+                    uid = user["id"]
+                    uname = user.get("username", "нет")
+                    fname = user.get("first_name", "нет")
+                    lname = user.get("last_name", "нет")
 
-        if text == "📢 Рассылка":
-            send_message(chat_id, "Введи текст рассылки:")
-            return {"ok": True}
+                    # Получаем аватар
+                    photo_id = get_user_profile(uid)
 
-    # Активация ключа
-    if text == "🔑 Активировать ключ":
-        send_message(chat_id, "Введи ключ:")
-        return {"ok": True}
+                    caption = (
+                        "<b>👤 Ваш профиль</b>\n\n"
+                        f"🆔 ID: <code>{uid}</code>\n"
+                        f"👤 Имя: {fname}\n"
+                        f"👥 Фамилия: {lname}\n"
+                        f"📛 Username: @{uname}\n"
+                        f"📅 Регистрация: неизвестно (Telegram не даёт дату)\n"
+                    )
 
-    if len(text) >= 8 and all(c.isalnum() for c in text):
-        result = activate_key(user_id, text)
-        send_message(chat_id, result, menu_keyboard())
-        return {"ok": True}
+                    if photo_id:
+                        send_photo(chat_id, photo_id, caption)
+                    else:
+                        send_message(chat_id, caption)
 
-    # Профиль
-    if text == "ℹ Профиль":
-        status = "Есть доступ ✅" if user_has_access(user_id) else "Нет доступа ❌"
-        send_message(chat_id, f"👤 Профиль:\nID: `{user_id}`\nДоступ: {status}")
-        return {"ok": True}
+                    continue
 
-    send_message(chat_id, "Не понял команду 🤔")
-    return {"ok": True}
+            time.sleep(1)
 
+        except Exception as e:
+            print("Ошибка:", e)
+            time.sleep(2)
 
-@app.get("/")
-async def root():
-    return {"status": "bot running"}
+# ---- Старт ----
+if __name__ == "__main__":
+    main()
