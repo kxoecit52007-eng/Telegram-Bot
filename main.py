@@ -1,110 +1,76 @@
-import requests
-import time
+import os
+from aiogram import Bot, Dispatcher, types
+from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
+from aiohttp import web
+import httpx
 
-TOKEN = "8453302588:AAF3Yq8YeqYNeESsnZNGEmJL9MXGvKVIleo"
-API_URL = f"https://api.telegram.org/bot8453302588:AAF3Yq8YeqYNeESsnZNGEmJL9MXGvKVIleo/"
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+WEBHOOK_URL = os.getenv("WEBHOOK_URL")
 
-# ---- Функции ----
+bot = Bot(token=TELEGRAM_TOKEN)
+dp = Dispatcher()
 
-def send_message(chat_id, text, reply_markup=None):
-    data = {"chat_id": chat_id, "text": text, "parse_mode": "HTML"}
-    if reply_markup:
-        data["reply_markup"] = reply_markup
-    requests.post(API_URL + "sendMessage", json=data)
+async def ask_openai(user_text: str) -> str:
+    """
+    Отправляет запрос к OpenAI Chat Completions
+    """
+    url = "https://api.openai.com/v1/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {OPENAI_API_KEY}",
+        "Content-Type": "application/json"
+    }
 
-def get_user_profile(user_id):
-    r = requests.get(API_URL + f"getUserProfilePhotos?user_id={user_id}&limit=1").json()
-    try:
-        file_id = r["result"]["photos"][0][0]["file_id"]
-        return file_id
-    except:
-        return None
+    payload = {
+        "model": "gpt-4o-mini",   # можешь заменить на gpt-4o или gpt-4.1
+        "messages": [
+            {"role": "system", "content": "Ты - полезный умный Telegram-бот."},
+            {"role": "user", "content": user_text}
+        ],
+        "temperature": 0.7
+    }
 
-def send_photo(chat_id, file_id, caption):
-    data = {"chat_id": chat_id, "photo": file_id, "caption": caption}
-    requests.post(API_URL + "sendPhoto", json=data)
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        r = await client.post(url, json=payload, headers=headers)
 
-# ---- Главное меню ----
+    if r.status_code != 200:
+        return f"Ошибка OpenAI: {r.text}"
 
-MAIN_MENU = {
-    "keyboard": [
-        ["Пожаловаться на аккаунт"],
-        ["Профиль"],
-        ["Подписка"]
-    ],
-    "resize_keyboard": True
-}
+    data = r.json()
+    reply = data["choices"][0]["message"]["content"]
+    return reply
 
-# ---- Основной цикл ----
+
+@dp.message()
+async def handle_message(message: types.Message):
+    user_text = message.text
+
+    await message.answer("💬 Думаю...")
+
+    reply = await ask_openai(user_text)
+
+    await message.answer(reply)
+
+
+async def on_startup(app):
+    await bot.set_webhook(WEBHOOK_URL)
+
+async def on_shutdown(app):
+    await bot.delete_webhook()
+    await bot.session.close()
 
 def main():
-    last_update = 0
-    print("Бот запущен!")
+    app = web.Application()
+    app.on_startup.append(on_startup)
+    app.on_shutdown.append(on_shutdown)
 
-    while True:
-        try:
-            updates = requests.get(API_URL + f"getUpdates?offset={last_update + 1}").json()
+    SimpleRequestHandler(
+        dispatcher=dp,
+        bot=bot,
+        handle_in_background=True
+    ).register(app, path="/webhook")
 
-            for update in updates.get("result", []):
-                last_update = update["update_id"]
+    return app
 
-                if "message" not in update:
-                    continue
-
-                msg = update["message"]
-                chat_id = msg["chat"]["id"]
-                text = msg.get("text", "")
-
-                # Приветствие + меню
-                if text == "/start":
-                    send_message(
-                        chat_id,
-                        "👋 Привет! Я бот MetaSnos.\nВыбери действие ниже:",
-                        reply_markup={"keyboard": MAIN_MENU["keyboard"], "resize_keyboard": True}
-                    )
-                    continue
-
-                # --- Кнопки ---
-                if text == "Пожаловаться на аккаунт":
-                    send_message(chat_id, "⚠ Функция находится в разработке...")
-                    continue
-
-                if text == "Подписка":
-                    send_message(chat_id, "💎 Раздел подписок скоро будет готов...")
-                    continue
-
-                if text == "Профиль":
-                    user = msg["from"]
-                    uid = user["id"]
-                    uname = user.get("username", "нет")
-                    fname = user.get("first_name", "нет")
-                    lname = user.get("last_name", "нет")
-
-                    # Получаем аватар
-                    photo_id = get_user_profile(uid)
-
-                    caption = (
-                        "<b>👤 Ваш профиль</b>\n\n"
-                        f"🆔 ID: <code>{uid}</code>\n"
-                        f"👤 Имя: {fname}\n"
-                        f"👥 Фамилия: {lname}\n"
-                        f"📛 Username: @{uname}\n"
-                        f"📅 Регистрация: неизвестно (Telegram не даёт дату)\n"
-                    )
-
-                    if photo_id:
-                        send_photo(chat_id, photo_id, caption)
-                    else:
-                        send_message(chat_id, caption)
-
-                    continue
-
-            time.sleep(1)
-
-        except Exception as e:
-            print("Ошибка:", e)
-            time.sleep(2)
-
-# ---- Старт ----
 if __name__ == "__main__":
-    main()
+    web.run_app(main(), host="0.0.0.0", port=int(os.getenv("PORT", 10000)))
